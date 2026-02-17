@@ -19,6 +19,8 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import time
 import warnings
+import gc
+import torch
 warnings.filterwarnings('ignore')
 
 
@@ -28,8 +30,8 @@ warnings.filterwarnings('ignore')
 
 CONFIG = {
     # Chemins (à adapter)
-    "images_dir": "C:/Users/NEBRATA/Desktop/Memoire/modeles/segmentation/dataset1/images/default",
-    "annotations_file": "C:/Users/NEBRATA/Desktop/Memoire/modeles/segmentation/dataset1/annotations/instances_default.json",
+    "images_dir": "../dataset1/images/default",
+    "annotations_file": "../dataset1/annotations/instances_default.json",
     "output_dir": "./output",
     
     # Classes (dans l'ordre de CVAT) - IDENTIQUE aux autres modèles
@@ -244,6 +246,8 @@ def train_yolo26_seg():
     model_name = f"yolo26{CONFIG['model_size']}-seg.pt"
     print(f"\n🧠 Chargement du modèle {model_name}...")
     
+    gc.collect()
+
     model = YOLO(model_name)
     
     print(f"   Classes: {CONFIG['classes']}")
@@ -275,7 +279,18 @@ def train_yolo26_seg():
         save=True,
         save_period=CONFIG["save_every"],
         plots=True,
+        # ↓↓↓ AJOUTS POUR CORRIGER LA MÉMOIRE ↓↓↓
+        cache=False,   # Ne pas mettre les images en RAM entre les epochs
+        workers=0,     # Pas de sous-processus DataLoader (chacun duplique la RAM)
+        amp=False,     # Désactiver mixed precision si GPU < 4 Go
     )
+
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
     
     total_time = time.time() - start_time
     training_end = datetime.now()
