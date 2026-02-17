@@ -1,24 +1,29 @@
 """
 Inférence YOLO26-seg - Prédiction sur nouvelles images
-Structure identique à Mask R-CNN et DeepLabV3+ pour comparaison
+Segmentation des toitures cadastrales
+
+Fonctionnalités:
+- Temps d'inférence par image
+- Résumé global pour les dossiers
+- Export des masques
+- Rapports JSON détaillés
 """
 
 import os
-import json
 import numpy as np
-from ultralytics import YOLO
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from pathlib import Path
-from tqdm import tqdm
+from ultralytics import YOLO
 import argparse
-import warnings
-warnings.filterwarnings('ignore')
+from pathlib import Path
+from datetime import datetime
+import time
+import json
 
 
 # =============================================================================
-# CONFIGURATION (identique aux autres modèles)
+# CONFIGURATION
 # =============================================================================
 
 CLASSES = [
@@ -38,19 +43,38 @@ COLORS = {
 
 
 # =============================================================================
+# UTILITAIRES
+# =============================================================================
+
+def format_time(seconds):
+    if seconds < 1:
+        return f"{seconds*1000:.1f} ms"
+    elif seconds < 60:
+        return f"{seconds:.2f} s"
+    else:
+        return f"{int(seconds//60)}m {seconds%60:.1f}s"
+
+
+# =============================================================================
+# MODÈLE
+# =============================================================================
+
+def load_model(checkpoint_path):
+    model = YOLO(checkpoint_path)
+    print(f"✅ Modèle chargé: {checkpoint_path}")
+    return model
+
+
+# =============================================================================
 # INFÉRENCE
 # =============================================================================
 
-def predict(model, image_path, score_threshold=0.5):
-    """Faire une prédiction sur une image"""
-    
+def predict(model, image_path, threshold=0.5):
     image = Image.open(image_path).convert("RGB")
     
-    results = model.predict(
-        image_path,
-        conf=score_threshold,
-        verbose=False
-    )
+    start_time = time.time()
+    results = model.predict(image_path, conf=threshold, verbose=False)
+    inference_time = time.time() - start_time
     
     result = results[0]
     
@@ -59,7 +83,8 @@ def predict(model, image_path, score_threshold=0.5):
         'labels': [],
         'scores': [],
         'masks': [],
-        'class_names': []
+        'class_names': [],
+        'inference_time': inference_time
     }
     
     if result.masks is not None and len(result.boxes) > 0:
@@ -67,15 +92,13 @@ def predict(model, image_path, score_threshold=0.5):
         predictions['labels'] = result.boxes.cls.cpu().numpy().astype(int)
         predictions['scores'] = result.boxes.conf.cpu().numpy()
         
-        # Masques
         masks_data = result.masks.data.cpu().numpy()
         orig_shape = result.orig_shape
         
         for i in range(len(masks_data)):
             mask = masks_data[i]
             mask_resized = np.array(Image.fromarray(mask.astype(np.uint8)).resize(
-                (orig_shape[1], orig_shape[0]), Image.NEAREST
-            ))
+                (orig_shape[1], orig_shape[0]), Image.NEAREST))
             predictions['masks'].append(mask_resized > 0.5)
         
         predictions['class_names'] = [CLASSES[int(l) + 1] for l in predictions['labels']]
@@ -83,210 +106,226 @@ def predict(model, image_path, score_threshold=0.5):
     return image, predictions
 
 
-def calculate_surface(mask, pixel_size_m2=None):
-    """Calculer la surface d'un masque"""
-    surface_pixels = np.sum(mask > 0)
-    
-    if pixel_size_m2 is not None:
-        return surface_pixels * pixel_size_m2
-    return surface_pixels
+def calculate_surface(mask):
+    return int(np.sum(mask > 0))
 
 
 # =============================================================================
-# VISUALISATION (identique aux autres modèles)
+# VISUALISATION
 # =============================================================================
 
 def visualize_predictions(image, predictions, output_path=None, show=True):
-    """Visualiser les prédictions avec masques et boîtes"""
-    
     fig, axes = plt.subplots(1, 2, figsize=(16, 8))
     
-    # Image originale
     axes[0].imshow(image)
     axes[0].set_title("Image originale")
     axes[0].axis('off')
     
-    # Image avec prédictions
     axes[1].imshow(image)
     
     boxes = predictions['boxes']
-    labels = predictions['labels']
     scores = predictions['scores']
     masks = predictions['masks']
     class_names = predictions['class_names']
+    inference_time = predictions.get('inference_time', 0)
     
-    # Overlay des masques
     overlay = np.zeros((*np.array(image).shape[:2], 4))
     
     for i in range(len(boxes)):
         class_name = class_names[i]
         color = COLORS.get(class_name, (128, 128, 128))
-        color_normalized = [c/255 for c in color]
+        color_norm = [c/255 for c in color]
         
-        # Masque
         if i < len(masks):
-            mask = masks[i]
-            overlay[mask > 0] = [*color_normalized, 0.5]
+            overlay[masks[i] > 0] = [*color_norm, 0.5]
         
-        # Boîte
-        box = boxes[i]
-        x1, y1, x2, y2 = box
-        rect = patches.Rectangle(
-            (x1, y1), x2-x1, y2-y1,
-            linewidth=2,
-            edgecolor=color_normalized,
-            facecolor='none'
-        )
+        x1, y1, x2, y2 = boxes[i]
+        rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2,
+                                  edgecolor=color_norm, facecolor='none')
         axes[1].add_patch(rect)
         
-        # Label
-        score = scores[i]
         surface = calculate_surface(masks[i]) if i < len(masks) else 0
-        label_text = f"{class_name}\n{score:.2f} | {surface:,} px"
-        axes[1].text(
-            x1, y1-10,
-            label_text,
-            fontsize=8,
-            color='white',
-            bbox=dict(boxstyle='round', facecolor=color_normalized, alpha=0.8)
-        )
+        axes[1].text(x1, y1-5, f"{class_name}\n{scores[i]:.2f} | {surface:,} px",
+                     fontsize=8, color='white',
+                     bbox=dict(boxstyle='round', facecolor=color_norm, alpha=0.8))
     
     axes[1].imshow(overlay)
-    axes[1].set_title(f"Prédictions ({len(boxes)} objets détectés)")
+    axes[1].set_title(f"YOLO26-seg ({len(boxes)} objets) | ⏱️ {format_time(inference_time)}")
     axes[1].axis('off')
     
     plt.tight_layout()
-    
     if output_path:
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        print(f"Résultat sauvegardé: {output_path}")
-    
     if show:
         plt.show()
-    
     plt.close()
 
 
 def export_masks(predictions, output_dir, image_name):
-    """Exporter les masques individuels"""
-    
     os.makedirs(output_dir, exist_ok=True)
-    
-    for i, (mask, class_name, score) in enumerate(zip(
-        predictions['masks'],
-        predictions['class_names'],
-        predictions['scores']
-    )):
-        mask_binary = (mask > 0.5).astype(np.uint8) * 255
-        mask_image = Image.fromarray(mask_binary)
-        
-        mask_path = os.path.join(
-            output_dir,
-            f"{image_name}_{i:02d}_{class_name}_{score:.2f}.png"
-        )
-        mask_image.save(mask_path)
-    
-    print(f"Masques exportés dans: {output_dir}")
+    for i in range(len(predictions['masks'])):
+        class_name = predictions['class_names'][i]
+        score = predictions['scores'][i]
+        mask = (predictions['masks'][i] > 0).astype(np.uint8) * 255
+        Image.fromarray(mask).save(os.path.join(output_dir, f"{i:02d}_{class_name}_{score:.2f}.png"))
 
 
 def generate_report(predictions, image_name):
-    """Générer un rapport des surfaces détectées (identique aux autres modèles)"""
+    inference_time = predictions.get('inference_time', 0)
     
     report = {
         'image': image_name,
+        'timestamp': datetime.now().isoformat(),
+        'inference_time_ms': inference_time * 1000,
         'total_objects': len(predictions['boxes']),
-        'surfaces_by_class': {},
+        'surfaces_by_class': {c: {'count': 0, 'total_surface_px': 0} for c in CLASSES[1:]},
         'details': []
     }
     
-    for class_name in CLASSES[1:]:
-        report['surfaces_by_class'][class_name] = {
-            'count': 0,
-            'total_surface_px': 0
-        }
-    
     for i in range(len(predictions['boxes'])):
         class_name = predictions['class_names'][i]
-        score = predictions['scores'][i]
-        box = predictions['boxes'][i]
+        score = float(predictions['scores'][i])
         surface = calculate_surface(predictions['masks'][i]) if i < len(predictions['masks']) else 0
         
         report['surfaces_by_class'][class_name]['count'] += 1
         report['surfaces_by_class'][class_name]['total_surface_px'] += surface
-        
         report['details'].append({
-            'id': i,
-            'class': class_name,
-            'score': float(score),
-            'surface_px': int(surface),
-            'bbox': box.tolist()
+            'id': i, 'class': class_name, 'score': score,
+            'surface_px': surface, 'bbox': predictions['boxes'][i].tolist()
         })
-    
     return report
 
 
-def print_report(report):
-    """Afficher le rapport (identique aux autres modèles)"""
-    print("\n" + "=" * 50)
-    print(f"RAPPORT DE SEGMENTATION - {report['image']}")
-    print("=" * 50)
-    print(f"Total objets détectés: {report['total_objects']}")
-    print("\nSurfaces par classe:")
-    print("-" * 50)
+# =============================================================================
+# RÉSUMÉ GLOBAL
+# =============================================================================
+
+def generate_summary(all_reports, output_dir, total_processing_time):
+    summary = {
+        'timestamp': datetime.now().isoformat(),
+        'model': 'YOLO26-seg',
+        'total_images': len(all_reports),
+        'total_processing_time_s': total_processing_time,
+        'avg_inference_time_ms': 0,
+        'total_objects': 0,
+        'objects_by_class': {c: 0 for c in CLASSES[1:]},
+        'surfaces_by_class': {c: 0 for c in CLASSES[1:]},
+        'per_image_stats': []
+    }
     
-    for class_name, data in report['surfaces_by_class'].items():
-        if data['count'] > 0:
-            print(f"  {class_name}:")
-            print(f"    - Nombre: {data['count']}")
-            print(f"    - Surface totale: {data['total_surface_px']:,} pixels")
+    total_inference_time = 0
+    for report in all_reports:
+        total_inference_time += report['inference_time_ms']
+        summary['total_objects'] += report['total_objects']
+        for class_name, data in report['surfaces_by_class'].items():
+            summary['objects_by_class'][class_name] += data['count']
+            summary['surfaces_by_class'][class_name] += data['total_surface_px']
+        summary['per_image_stats'].append({
+            'image': report['image'],
+            'objects': report['total_objects'],
+            'inference_time_ms': report['inference_time_ms']
+        })
     
-    print("\nDétails:")
-    print("-" * 50)
-    for obj in report['details']:
-        print(f"  [{obj['id']}] {obj['class']} (conf: {obj['score']:.2f}) - {obj['surface_px']:,} px")
+    summary['avg_inference_time_ms'] = total_inference_time / len(all_reports) if all_reports else 0
     
-    print("=" * 50)
+    with open(os.path.join(output_dir, "summary.json"), 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    
+    total_surface = sum(summary['surfaces_by_class'].values())
+    with open(os.path.join(output_dir, "summary.txt"), 'w', encoding='utf-8') as f:
+        f.write("=" * 70 + "\n")
+        f.write("   RÉSUMÉ D'INFÉRENCE - YOLO26-SEG CADASTRAL\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(f"📅 Date: {summary['timestamp']}\n")
+        f.write(f"🖼️  Images traitées: {summary['total_images']}\n")
+        f.write(f"⏱️  Temps total: {format_time(summary['total_processing_time_s'])}\n")
+        f.write(f"⏱️  Temps moyen/image: {summary['avg_inference_time_ms']:.1f} ms\n")
+        f.write(f"🎯 Total objets: {summary['total_objects']}\n\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"{'Classe':<25} {'Objets':>10} {'Surface (px)':>15} {'%':>10}\n")
+        f.write("-" * 70 + "\n")
+        for class_name in CLASSES[1:]:
+            count = summary['objects_by_class'][class_name]
+            surface = summary['surfaces_by_class'][class_name]
+            pct = (surface / total_surface * 100) if total_surface > 0 else 0
+            f.write(f"{class_name:<25} {count:>10} {surface:>15,} {pct:>9.1f}%\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"{'TOTAL':<25} {summary['total_objects']:>10} {total_surface:>15,} {'100.0%':>10}\n")
+        f.write("\n" + "-" * 70 + "\n")
+        f.write("DÉTAILS PAR IMAGE\n" + "-" * 70 + "\n")
+        f.write(f"{'Image':<40} {'Objets':>10} {'Temps (ms)':>15}\n")
+        f.write("-" * 70 + "\n")
+        for stat in summary['per_image_stats']:
+            img_name = stat['image'][:38] + '..' if len(stat['image']) > 40 else stat['image']
+            f.write(f"{img_name:<40} {stat['objects']:>10} {stat['inference_time_ms']:>15.1f}\n")
+        f.write("=" * 70 + "\n")
+    
+    return summary
+
+
+def print_summary(summary):
+    print("\n" + "=" * 70)
+    print("   📊 RÉSUMÉ GLOBAL - YOLO26-SEG")
+    print("=" * 70)
+    print(f"\n   🖼️  Images traitées:     {summary['total_images']}")
+    print(f"   ⏱️  Temps total:          {format_time(summary['total_processing_time_s'])}")
+    print(f"   ⏱️  Temps moyen/image:    {summary['avg_inference_time_ms']:.1f} ms")
+    print(f"   🎯 Total objets:         {summary['total_objects']}")
+    
+    total_surface = sum(summary['surfaces_by_class'].values())
+    print(f"\n   📋 Par classe:")
+    for class_name in CLASSES[1:]:
+        count = summary['objects_by_class'][class_name]
+        surface = summary['surfaces_by_class'][class_name]
+        pct = (surface / total_surface * 100) if total_surface > 0 else 0
+        if count > 0:
+            print(f"      • {class_name}: {count} objets | {surface:,} px ({pct:.1f}%)")
+    print("\n" + "=" * 70)
 
 
 # =============================================================================
 # BATCH PROCESSING
 # =============================================================================
 
-def process_directory(model, input_dir, output_dir, score_threshold=0.5):
-    """Traiter toutes les images d'un répertoire"""
-    
+def process_directory(model, input_dir, output_dir, threshold=0.5, export_masks_flag=False):
     os.makedirs(output_dir, exist_ok=True)
     
-    image_extensions = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
-    image_paths = [
-        p for p in Path(input_dir).iterdir()
-        if p.suffix.lower() in image_extensions
-    ]
+    image_extensions = {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp'}
+    image_paths = sorted([p for p in Path(input_dir).iterdir() if p.suffix.lower() in image_extensions])
     
-    print(f"\nTraitement de {len(image_paths)} images...")
+    if not image_paths:
+        print(f"❌ Aucune image trouvée dans {input_dir}")
+        return []
+    
+    print(f"\n🖼️  {len(image_paths)} images à traiter\n")
     
     all_reports = []
+    start_total = time.time()
     
-    for img_path in tqdm(image_paths, desc="Inférence"):
-        # Prédiction
-        image, predictions = predict(model, str(img_path), score_threshold)
+    for idx, img_path in enumerate(image_paths, 1):
+        print(f"[{idx}/{len(image_paths)}] 🔍 {img_path.name}")
         
-        # Visualisation
+        image, predictions = predict(model, str(img_path), threshold)
+        
         output_path = os.path.join(output_dir, f"{img_path.stem}_pred.png")
         visualize_predictions(image, predictions, output_path, show=False)
         
-        # Rapport
+        if export_masks_flag and len(predictions['masks']) > 0:
+            export_masks(predictions, os.path.join(output_dir, "masks", img_path.stem), img_path.stem)
+        
         report = generate_report(predictions, img_path.name)
         all_reports.append(report)
-        print_report(report)
+        print(f"   ✅ {report['total_objects']} objets | ⏱️ {report['inference_time_ms']:.1f} ms")
     
-    # Sauvegarder tous les rapports
-    reports_path = os.path.join(output_dir, "reports.json")
-    with open(reports_path, 'w') as f:
-        json.dump(all_reports, f, indent=2)
+    total_processing_time = time.time() - start_total
     
-    print(f"\nRapports sauvegardés: {reports_path}")
+    with open(os.path.join(output_dir, "reports.json"), 'w', encoding='utf-8') as f:
+        json.dump(all_reports, f, indent=2, ensure_ascii=False)
     
+    summary = generate_summary(all_reports, output_dir, total_processing_time)
+    print_summary(summary)
+    
+    print(f"\n📁 Résultats sauvegardés dans: {output_dir}")
     return all_reports
 
 
@@ -296,36 +335,43 @@ def process_directory(model, input_dir, output_dir, score_threshold=0.5):
 
 def main():
     parser = argparse.ArgumentParser(description="Inférence YOLO26-seg Cadastral")
-    parser.add_argument("--model", type=str, required=True, help="Chemin vers le modèle")
-    parser.add_argument("--input", type=str, required=True, help="Image ou dossier d'images")
-    parser.add_argument("--output", type=str, default="./predictions", help="Dossier de sortie")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Seuil de confiance")
-    parser.add_argument("--export-masks", action="store_true", help="Exporter les masques individuels")
+    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--input", type=str, required=True)
+    parser.add_argument("--output", type=str, default="./predictions")
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--export-masks", action="store_true")
+    parser.add_argument("--no-display", action="store_true")
     
     args = parser.parse_args()
     
-    # Charger le modèle
-    print(f"Chargement du modèle: {args.model}")
-    model = YOLO(args.model)
-    
-    # Traitement
+    model = load_model(args.model)
     input_path = Path(args.input)
     
     if input_path.is_dir():
-        process_directory(model, str(input_path), args.output, args.threshold)
+        process_directory(model, str(input_path), args.output, args.threshold, args.export_masks)
     else:
         os.makedirs(args.output, exist_ok=True)
+        print(f"\n🔍 Traitement: {input_path.name}")
         
         image, predictions = predict(model, str(input_path), args.threshold)
         
         output_path = os.path.join(args.output, f"{input_path.stem}_pred.png")
-        visualize_predictions(image, predictions, output_path)
+        visualize_predictions(image, predictions, output_path, show=not args.no_display)
         
-        if args.export_masks:
+        if args.export_masks and len(predictions['masks']) > 0:
             export_masks(predictions, os.path.join(args.output, "masks"), input_path.stem)
         
         report = generate_report(predictions, input_path.name)
-        print_report(report)
+        print(f"\n{'='*60}")
+        print(f"📊 RAPPORT - {report['image']}")
+        print(f"   ⏱️  Temps: {report['inference_time_ms']:.1f} ms | 🎯 Objets: {report['total_objects']}")
+        for class_name, data in report['surfaces_by_class'].items():
+            if data['count'] > 0:
+                print(f"      • {class_name}: {data['count']} objets, {data['total_surface_px']:,} px")
+        print(f"{'='*60}")
+        
+        with open(os.path.join(args.output, f"{input_path.stem}_report.json"), 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":
