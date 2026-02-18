@@ -213,6 +213,9 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
+    print("Images:", os.getenv("SEGMENTATION_DATASET_IMAGES_DIR"))
+    print("Annotations:", os.getenv("SEGMENTATION_DATASET_ANNOTATIONS_FILE"))
+
     valid = verify_dataset(args.images, args.annotations)
     
     if valid and args.visualize:
