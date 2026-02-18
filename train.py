@@ -21,6 +21,7 @@ import time
 import warnings
 import gc
 import torch
+import yaml
 warnings.filterwarnings('ignore')
 
 
@@ -28,19 +29,23 @@ warnings.filterwarnings('ignore')
 # CONFIGURATION (identique à Mask R-CNN et DeepLabV3+)
 # =============================================================================
 
+def load_classes(yaml_path=None):
+    path = yaml_path or os.getenv("CLASSES_FILE", "classes.yaml")
+    with open(path, 'r', encoding='utf-8') as f:
+        data = yaml.safe_load(f)
+    # YOLO n'utilise pas __background__, on le retire
+    classes = data['classes']
+    return [c for c in classes if c != '__background__']
+
 CONFIG = {
     # Chemins (à adapter)
     "images_dir":  os.getenv("SEGMENTATION_DATASET_IMAGES_DIR"),
     "annotations_file": os.getenv("SEGMENTATION_DATASET_ANNOTATIONS_FILE"),
+    "classes_file": os.getenv("CLASSES_FILE", "classes.yaml"),
     "output_dir": "./output",
     
     # Classes (dans l'ordre de CVAT) - IDENTIQUE aux autres modèles
-    "classes": [
-        "toiture_tole_ondulee",  # 0
-        "toiture_tole_bac",      # 1
-        "toiture_tuile",         # 2
-        "toiture_dalle"          # 3
-    ],
+    "classes": load_classes(), 
     
     # Modèle YOLO26-seg
     "model_size": "n",  # n, s, m, l, x

@@ -20,6 +20,7 @@ from collections import defaultdict
 from tqdm import tqdm
 from datetime import datetime
 import warnings
+import yaml
 warnings.filterwarnings('ignore')
 
 
@@ -27,22 +28,25 @@ warnings.filterwarnings('ignore')
 # CONFIGURATION (identique à Mask R-CNN et DeepLabV3+)
 # =============================================================================
 
+def load_classes(yaml_path=None):
+    path = yaml_path or os.getenv("CLASSES_FILE", "classes.yaml")
+    with open(path, 'r', encoding='utf-8') as f:
+        data = yaml.safe_load(f)
+    # YOLO n'utilise pas __background__, on le retire
+    classes = data['classes']
+    return [c for c in classes if c != '__background__']
+
 CONFIG = {
     # Chemins
     "images_dir":  os.getenv("SEGMENTATION_DATASET_IMAGES_DIR"),
     "annotations_file": os.getenv("SEGMENTATION_DATASET_ANNOTATIONS_FILE"),
-    # "model_path": "./output/best_model.pt",
-    "model_path": "yolo26n-seg.pt",
+    "classes_file": os.getenv("CLASSES_FILE", "classes.yaml"),
+    "model_path": "./output/best_model.pt",
+    # "model_path": "yolo26n-seg.pt",
     "output_dir": "./evaluation",
     
     # Classes (identique aux autres modèles)
-    "classes": [
-        "__background__",
-        "toiture_tole_ondulee",
-        "toiture_tole_bac",
-        "toiture_tuile",
-        "toiture_dalle"
-    ],
+    "classes": load_classes(), 
     
     # Paramètres d'évaluation (identique aux autres modèles)
     "score_threshold": 0.5,
