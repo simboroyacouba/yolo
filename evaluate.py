@@ -29,8 +29,8 @@ warnings.filterwarnings('ignore')
 
 CONFIG = {
     # Chemins
-    "images_dir": "../dataset1/images/default",
-    "annotations_file": "../dataset1/annotations/instances_default.json",
+    "images_dir":  os.getenv("SEGMENTATION_DATASET_IMAGES_DIR"),
+    "annotations_file": os.getenv("SEGMENTATION_DATASET_ANNOTATIONS_FILE"),
     # "model_path": "./output/best_model.pt",
     "model_path": "yolo26n-seg.pt",
     "output_dir": "./evaluation",
