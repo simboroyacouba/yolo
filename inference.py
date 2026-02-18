@@ -10,12 +10,16 @@ Fonctionnalités:
 """
 
 import os
+from dotenv import load_dotenv
+
+# Charger les variables d'environnement
+load_dotenv()
+
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from ultralytics import YOLO
-import argparse
 from pathlib import Path
 from datetime import datetime
 import time
@@ -39,6 +43,15 @@ COLORS = {
     "toiture_tole_bac": (0, 255, 0),
     "toiture_tuile": (0, 0, 255),
     "toiture_dalle": (255, 165, 0),
+}
+
+CONFIG = {
+    "model_path": os.getenv("SEGMENTATION_MODEL_PATH", "./runs/segment/train/weights/best.pt"),
+    "input_dir": os.getenv("SEGMENTATION_TEST_IMAGES_DIR", "./test_images"),
+    "output_dir": os.getenv("SEGMENTATION_OUTPUT_DIR", "./predictions"),
+    "score_threshold": 0.5,
+    "export_masks": False,
+    "show_display": False,
 }
 
 
@@ -287,7 +300,7 @@ def print_summary(summary):
 # BATCH PROCESSING
 # =============================================================================
 
-def process_directory(model, input_dir, output_dir, threshold=0.5, export_masks_flag=False):
+def process_directory(model, input_dir, output_dir, threshold=0.5, export_masks_flag=False, show_display=False):
     os.makedirs(output_dir, exist_ok=True)
     
     image_extensions = {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp'}
@@ -308,7 +321,7 @@ def process_directory(model, input_dir, output_dir, threshold=0.5, export_masks_
         image, predictions = predict(model, str(img_path), threshold)
         
         output_path = os.path.join(output_dir, f"{img_path.stem}_pred.png")
-        visualize_predictions(image, predictions, output_path, show=False)
+        visualize_predictions(image, predictions, output_path, show=show_display)
         
         if export_masks_flag and len(predictions['masks']) > 0:
             export_masks(predictions, os.path.join(output_dir, "masks", img_path.stem), img_path.stem)
@@ -334,43 +347,64 @@ def process_directory(model, input_dir, output_dir, threshold=0.5, export_masks_
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Inférence YOLO26-seg Cadastral")
-    parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--input", type=str, required=True)
-    parser.add_argument("--output", type=str, default="./predictions")
-    parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--export-masks", action="store_true")
-    parser.add_argument("--no-display", action="store_true")
+    # Configuration depuis variables d'environnement
+    model_path = CONFIG["model_path"]
+    input_dir = CONFIG["input_dir"]
+    output_dir = CONFIG["output_dir"]
+    score_threshold = CONFIG["score_threshold"]
+    export_masks_flag = CONFIG["export_masks"]
+    show_display = CONFIG["show_display"]
     
-    args = parser.parse_args()
+    # Vérifications
+    if not os.path.exists(model_path):
+        print(f"❌ Modèle non trouvé: {model_path}")
+        print(f"   Définissez SEGMENTATION_MODEL_PATH")
+        return
     
-    model = load_model(args.model)
-    input_path = Path(args.input)
+    if not os.path.exists(input_dir):
+        print(f"❌ Dossier d'images non trouvé: {input_dir}")
+        print(f"   Définissez SEGMENTATION_TEST_IMAGES_DIR")
+        return
+    
+    print("=" * 70)
+    print("   🚀 INFÉRENCE YOLO26-SEG CADASTRAL")
+    print("=" * 70)
+    print(f"\n📂 Configuration:")
+    print(f"   • Modèle:      {model_path}")
+    print(f"   • Images:      {input_dir}")
+    print(f"   • Sortie:      {output_dir}")
+    print(f"   • Seuil:       {score_threshold}")
+    
+    model = load_model(model_path)
+    
+    input_path = Path(input_dir)
     
     if input_path.is_dir():
-        process_directory(model, str(input_path), args.output, args.threshold, args.export_masks)
+        process_directory(model, str(input_path), output_dir, score_threshold, export_masks_flag, show_display)
     else:
-        os.makedirs(args.output, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
         print(f"\n🔍 Traitement: {input_path.name}")
         
-        image, predictions = predict(model, str(input_path), args.threshold)
+        image, predictions = predict(model, str(input_path), score_threshold)
         
-        output_path = os.path.join(args.output, f"{input_path.stem}_pred.png")
-        visualize_predictions(image, predictions, output_path, show=not args.no_display)
+        output_path = os.path.join(output_dir, f"{input_path.stem}_pred.png")
+        visualize_predictions(image, predictions, output_path, show=show_display)
         
-        if args.export_masks and len(predictions['masks']) > 0:
-            export_masks(predictions, os.path.join(args.output, "masks"), input_path.stem)
+        if export_masks_flag and len(predictions['masks']) > 0:
+            export_masks(predictions, os.path.join(output_dir, "masks"), input_path.stem)
         
         report = generate_report(predictions, input_path.name)
         print(f"\n{'='*60}")
         print(f"📊 RAPPORT - {report['image']}")
-        print(f"   ⏱️  Temps: {report['inference_time_ms']:.1f} ms | 🎯 Objets: {report['total_objects']}")
+        print(f"{'='*60}")
+        print(f"   ⏱️  Temps d'inférence: {report['inference_time_ms']:.1f} ms")
+        print(f"   🎯 Objets détectés: {report['total_objects']}")
         for class_name, data in report['surfaces_by_class'].items():
             if data['count'] > 0:
                 print(f"      • {class_name}: {data['count']} objets, {data['total_surface_px']:,} px")
         print(f"{'='*60}")
         
-        with open(os.path.join(args.output, f"{input_path.stem}_report.json"), 'w', encoding='utf-8') as f:
+        with open(os.path.join(output_dir, f"{input_path.stem}_report.json"), 'w', encoding='utf-8') as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
 
 
