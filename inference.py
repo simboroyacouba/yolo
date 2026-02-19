@@ -50,7 +50,7 @@ COLORS = {
 
 
 CONFIG = {
-    "model_path": os.getenv("SEGMENTATION_MODEL_PATH", "./runs/segment/train/weights/best.pt"),
+    "model_path": os.getenv("SEGMENTATION_MODEL_PATH", "./runs/segment/output/train/weights/best.pt"),
     "input_dir": os.getenv("SEGMENTATION_TEST_IMAGES_DIR", "./test_images"),
     "classes_file": os.getenv("CLASSES_FILE", "classes.yaml"),
     "output_dir": os.getenv("SEGMENTATION_OUTPUT_DIR", "./predictions"),
