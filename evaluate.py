@@ -32,17 +32,14 @@ def load_classes(yaml_path=None):
     path = yaml_path or os.getenv("CLASSES_FILE", "classes.yaml")
     with open(path, 'r', encoding='utf-8') as f:
         data = yaml.safe_load(f)
-    # YOLO n'utilise pas __background__, on le retire
-    classes = data['classes']
-    return [c for c in classes if c != '__background__']
+    return data['classes']  # ✅ Ne pas filtrer __background__
 
 CONFIG = {
     # Chemins
     "images_dir":  os.getenv("SEGMENTATION_DATASET_IMAGES_DIR"),
     "annotations_file": os.getenv("SEGMENTATION_DATASET_ANNOTATIONS_FILE"),
     "classes_file": os.getenv("CLASSES_FILE", "classes.yaml"),
-    "model_path": "./output/best_model.pt",
-    # "model_path": "yolo26n-seg.pt",
+    "model_path": "./runs/segment/output/train/weights/best.pt",
     "output_dir": "./evaluation",
     
     # Classes (identique aux autres modèles)
@@ -83,183 +80,216 @@ def calculate_iou_boxes(box1, box2):
     return intersection / union if union > 0 else 0
 
 
+def calculate_ap(recalls, precisions):
+    """Calculer AP = aire sous la courbe Precision-Recall (interpolation continue)."""
+    recalls = np.concatenate([[0.0], recalls, [1.0]])
+    precisions = np.concatenate([[0.0], precisions, [0.0]])
+    for i in range(len(precisions) - 2, -1, -1):
+        precisions[i] = max(precisions[i], precisions[i + 1])
+    indices = np.where(recalls[1:] != recalls[:-1])[0] + 1
+    ap = np.sum((recalls[indices] - recalls[indices - 1]) * precisions[indices])
+    return float(ap)
+
+
 class MetricsCalculator:
     """
-    Classe pour calculer toutes les métriques
-    IDENTIQUE à Mask R-CNN pour comparaison équitable
+    Calcule le vrai mAP (mean Average Precision) = moyenne de l'AP
+    (aire sous la courbe Precision-Recall) par classe et par seuil IoU.
     """
-    
+
     def __init__(self, num_classes, class_names, iou_thresholds):
         self.num_classes = num_classes
         self.class_names = class_names
         self.iou_thresholds = iou_thresholds
         self.reset()
-    
+
     def reset(self):
-        """Réinitialiser les compteurs"""
-        self.tp_per_class = defaultdict(lambda: defaultdict(int))
-        self.fp_per_class = defaultdict(lambda: defaultdict(int))
-        self.fn_per_class = defaultdict(lambda: defaultdict(int))
-        
+        # class_id -> liste de {'score', 'ious': np.array(n_gt,), 'img_idx'}
+        self.detections = defaultdict(list)
+        # class_id -> nombre total d'instances GT
+        self.n_gts = defaultdict(int)
+        self._img_idx = 0
         self.box_ious = []
         self.mask_ious = []
-    
+
     def add_image(self, pred_boxes, pred_labels, pred_scores, pred_masks,
                   gt_boxes, gt_labels, gt_masks):
-        """Ajouter une image pour évaluation"""
-        
-        for iou_thresh in self.iou_thresholds:
-            for class_id in range(1, self.num_classes):
-                # Filtrer par classe
-                pred_mask_cls = pred_labels == class_id
-                gt_mask_cls = gt_labels == class_id
-                
-                pred_boxes_cls = pred_boxes[pred_mask_cls]
-                pred_scores_cls = pred_scores[pred_mask_cls]
-                pred_masks_cls = [pred_masks[i] for i in range(len(pred_masks)) if pred_mask_cls[i]]
-                
-                gt_boxes_cls = gt_boxes[gt_mask_cls]
-                gt_masks_cls = [gt_masks[i] for i in range(len(gt_masks)) if gt_mask_cls[i]]
-                
-                n_pred = len(pred_boxes_cls)
-                n_gt = len(gt_boxes_cls)
-                
-                if n_gt == 0 and n_pred == 0:
-                    continue
-                
-                if n_gt == 0:
-                    self.fp_per_class[class_id][iou_thresh] += n_pred
-                    continue
-                
-                if n_pred == 0:
-                    self.fn_per_class[class_id][iou_thresh] += n_gt
-                    continue
-                
-                # Calculer la matrice IoU
-                iou_matrix = np.zeros((n_pred, n_gt))
-                for i in range(n_pred):
-                    for j in range(n_gt):
-                        box_iou = calculate_iou_boxes(pred_boxes_cls[i], gt_boxes_cls[j])
-                        
-                        if len(pred_masks_cls) > i and len(gt_masks_cls) > j:
-                            mask_iou = calculate_iou_masks(pred_masks_cls[i], gt_masks_cls[j])
-                            iou_matrix[i, j] = (box_iou + mask_iou) / 2
-                        else:
-                            iou_matrix[i, j] = box_iou
-                        
-                        if iou_thresh == 0.5:
-                            self.box_ious.append(box_iou)
-                            if len(pred_masks_cls) > i and len(gt_masks_cls) > j:
-                                self.mask_ious.append(mask_iou)
-                
-                # Matching glouton
-                matched_gt = set()
-                matched_pred = set()
-                
-                sorted_indices = np.argsort(-pred_scores_cls)
-                
-                for pred_idx in sorted_indices:
-                    best_iou = 0
-                    best_gt = -1
-                    
-                    for gt_idx in range(n_gt):
-                        if gt_idx in matched_gt:
-                            continue
-                        if iou_matrix[pred_idx, gt_idx] > best_iou:
-                            best_iou = iou_matrix[pred_idx, gt_idx]
-                            best_gt = gt_idx
-                    
-                    if best_iou >= iou_thresh:
-                        matched_gt.add(best_gt)
-                        matched_pred.add(pred_idx)
-                        self.tp_per_class[class_id][iou_thresh] += 1
+        """Ajouter une image pour évaluation."""
+        for class_id in range(1, self.num_classes):
+            pred_cls = pred_labels == class_id
+            gt_cls = gt_labels == class_id
+
+            pred_b = pred_boxes[pred_cls]
+            pred_s = pred_scores[pred_cls]
+            pred_m = [pred_masks[i] for i, v in enumerate(pred_cls) if v]
+            gt_b = gt_boxes[gt_cls]
+            gt_m = [gt_masks[i] for i, v in enumerate(gt_cls) if v]
+
+            n_pred = len(pred_b)
+            n_gt = len(gt_b)
+            self.n_gts[class_id] += n_gt
+
+            if n_pred == 0:
+                continue
+
+            # Matrice IoU (n_pred x n_gt)
+            iou_matrix = np.zeros((n_pred, n_gt))
+            for i in range(n_pred):
+                for j in range(n_gt):
+                    box_iou_val = calculate_iou_boxes(pred_b[i], gt_b[j])
+                    if pred_m and gt_m:
+                        mask_iou_val = calculate_iou_masks(pred_m[i], gt_m[j])
+                        iou_matrix[i, j] = (box_iou_val + mask_iou_val) / 2
+                        self.mask_ious.append(mask_iou_val)
                     else:
-                        self.fp_per_class[class_id][iou_thresh] += 1
-                
-                self.fn_per_class[class_id][iou_thresh] += n_gt - len(matched_gt)
-    
+                        iou_matrix[i, j] = box_iou_val
+                    self.box_ious.append(box_iou_val)
+
+            # Stocker chaque détection avec son score et ses IoU avec les GT
+            for i in range(n_pred):
+                self.detections[class_id].append({
+                    'score': float(pred_s[i]),
+                    'ious': iou_matrix[i].copy(),
+                    'img_idx': self._img_idx
+                })
+
+        self._img_idx += 1
+
+    def _compute_ap(self, class_id, iou_thresh):
+        """AP = aire sous la courbe PR pour une classe à un seuil IoU donné."""
+        n_gt = self.n_gts[class_id]
+        dets = self.detections[class_id]
+        if n_gt == 0 or not dets:
+            return 0.0
+
+        dets_sorted = sorted(dets, key=lambda d: d['score'], reverse=True)
+        matched = defaultdict(set)  # img_idx -> ensemble d'indices GT matchés
+        tp_list, fp_list = [], []
+
+        for d in dets_sorted:
+            ious = d['ious']
+            img_idx = d['img_idx']
+            best_iou, best_j = 0.0, -1
+
+            for j, v in enumerate(ious):
+                if j not in matched[img_idx] and v > best_iou:
+                    best_iou, best_j = v, j
+
+            if best_iou >= iou_thresh:
+                tp_list.append(1); fp_list.append(0)
+                matched[img_idx].add(best_j)
+            else:
+                tp_list.append(0); fp_list.append(1)
+
+        tp_cum = np.cumsum(tp_list, dtype=float)
+        fp_cum = np.cumsum(fp_list, dtype=float)
+        recalls = tp_cum / n_gt
+        precisions = tp_cum / (tp_cum + fp_cum)
+        return calculate_ap(recalls, precisions)
+
+    def _compute_prf(self, class_id, iou_thresh, score_thresh=0.5):
+        """TP/FP/FN et Precision/Recall/F1 à un seuil de score fixe."""
+        n_gt = self.n_gts[class_id]
+        dets = [d for d in self.detections[class_id] if d['score'] >= score_thresh]
+        n_pred = len(dets)
+
+        if n_gt == 0 and n_pred == 0:
+            return {'TP': 0, 'FP': 0, 'FN': 0, 'Precision': 0.0, 'Recall': 0.0, 'F1': 0.0}
+        if n_gt == 0:
+            return {'TP': 0, 'FP': n_pred, 'FN': 0, 'Precision': 0.0, 'Recall': 0.0, 'F1': 0.0}
+        if n_pred == 0:
+            return {'TP': 0, 'FP': 0, 'FN': n_gt, 'Precision': 0.0, 'Recall': 0.0, 'F1': 0.0}
+
+        dets_sorted = sorted(dets, key=lambda d: d['score'], reverse=True)
+        matched = defaultdict(set)
+        tp = fp = 0
+
+        for d in dets_sorted:
+            ious = d['ious']
+            img_idx = d['img_idx']
+            best_iou, best_j = 0.0, -1
+
+            for j, v in enumerate(ious):
+                if j not in matched[img_idx] and v > best_iou:
+                    best_iou, best_j = v, j
+
+            if best_iou >= iou_thresh:
+                tp += 1; matched[img_idx].add(best_j)
+            else:
+                fp += 1
+
+        fn = n_gt - tp
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        return {'TP': tp, 'FP': fp, 'FN': fn,
+                'Precision': precision, 'Recall': recall, 'F1': f1}
+
     def compute_metrics(self):
-        """Calculer toutes les métriques finales (identique à Mask R-CNN)"""
-        
-        results = {
-            'per_class': {},
-            'overall': {},
-            'iou_stats': {}
-        }
-        
-        # Métriques par classe
+        """Calculer toutes les métriques finales."""
+        results = {'per_class': {}, 'overall': {}, 'iou_stats': {}}
+        score_thresh = CONFIG.get('score_threshold', 0.5)
+
+        # --- AP et PRF par classe ---
         for class_id in range(1, self.num_classes):
             class_name = self.class_names[class_id]
             results['per_class'][class_name] = {}
-            
             for iou_thresh in self.iou_thresholds:
-                tp = self.tp_per_class[class_id][iou_thresh]
-                fp = self.fp_per_class[class_id][iou_thresh]
-                fn = self.fn_per_class[class_id][iou_thresh]
-                
-                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-                
-                results['per_class'][class_name][f'iou_{iou_thresh}'] = {
-                    'TP': tp,
-                    'FP': fp,
-                    'FN': fn,
-                    'Precision': precision,
-                    'Recall': recall,
-                    'F1': f1
-                }
-        
-        # Métriques globales
+                prf = self._compute_prf(class_id, iou_thresh, score_thresh)
+                prf['AP'] = self._compute_ap(class_id, iou_thresh)
+                results['per_class'][class_name][f'iou_{iou_thresh}'] = prf
+
+        # --- Métriques globales micro-moyennées (à seuil fixe, pour le reporting) ---
         for iou_thresh in self.iou_thresholds:
-            total_tp = sum(self.tp_per_class[c][iou_thresh] for c in range(1, self.num_classes))
-            total_fp = sum(self.fp_per_class[c][iou_thresh] for c in range(1, self.num_classes))
-            total_fn = sum(self.fn_per_class[c][iou_thresh] for c in range(1, self.num_classes))
-            
-            precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
-            recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-            
+            total_tp = sum(results['per_class'][self.class_names[c]][f'iou_{iou_thresh}']['TP']
+                           for c in range(1, self.num_classes))
+            total_fp = sum(results['per_class'][self.class_names[c]][f'iou_{iou_thresh}']['FP']
+                           for c in range(1, self.num_classes))
+            total_fn = sum(results['per_class'][self.class_names[c]][f'iou_{iou_thresh}']['FN']
+                           for c in range(1, self.num_classes))
+            precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+            recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
             results['overall'][f'iou_{iou_thresh}'] = {
-                'TP': total_tp,
-                'FP': total_fp,
-                'FN': total_fn,
-                'Precision': precision,
-                'Recall': recall,
-                'F1': f1
+                'TP': total_tp, 'FP': total_fp, 'FN': total_fn,
+                'Precision': precision, 'Recall': recall, 'F1': f1
             }
-        
-        # mAP@50
-        results['mAP50'] = results['overall']['iou_0.5']['Precision']
-        
-        # mAP@50:95
-        precisions_all = [results['overall'][f'iou_{t}']['Precision'] for t in self.iou_thresholds]
-        results['mAP50_95'] = np.mean(precisions_all)
-        
-        # mAP par classe
+
+        # --- mAP@50 = moyenne de AP@50 sur toutes les classes ---
+        results['mAP50'] = float(np.mean([
+            results['per_class'][self.class_names[c]]['iou_0.5']['AP']
+            for c in range(1, self.num_classes)
+        ]))
+
+        # --- mAP@50:95 = moyenne de AP sur toutes les classes ET tous les seuils ---
+        results['mAP50_95'] = float(np.mean([
+            results['per_class'][self.class_names[c]][f'iou_{t}']['AP']
+            for c in range(1, self.num_classes)
+            for t in self.iou_thresholds
+        ]))
+
+        # --- AP par classe ---
         results['mAP_per_class'] = {}
         for class_id in range(1, self.num_classes):
             class_name = self.class_names[class_id]
-            precisions = [
-                results['per_class'][class_name][f'iou_{t}']['Precision']
-                for t in self.iou_thresholds
-            ]
             results['mAP_per_class'][class_name] = {
-                'AP50': results['per_class'][class_name]['iou_0.5']['Precision'],
-                'AP50_95': np.mean(precisions)
+                'AP50': results['per_class'][class_name]['iou_0.5']['AP'],
+                'AP50_95': float(np.mean([
+                    results['per_class'][class_name][f'iou_{t}']['AP']
+                    for t in self.iou_thresholds
+                ]))
             }
-        
-        # Stats IoU
+
+        # --- Stats IoU ---
         if self.box_ious:
-            results['iou_stats']['box_iou_mean'] = np.mean(self.box_ious)
-            results['iou_stats']['box_iou_std'] = np.std(self.box_ious)
-            results['iou_stats']['box_iou_median'] = np.median(self.box_ious)
-        
+            results['iou_stats']['box_iou_mean'] = float(np.mean(self.box_ious))
+            results['iou_stats']['box_iou_std'] = float(np.std(self.box_ious))
+            results['iou_stats']['box_iou_median'] = float(np.median(self.box_ious))
         if self.mask_ious:
-            results['iou_stats']['mask_iou_mean'] = np.mean(self.mask_ious)
-            results['iou_stats']['mask_iou_std'] = np.std(self.mask_ious)
-            results['iou_stats']['mask_iou_median'] = np.median(self.mask_ious)
-        
+            results['iou_stats']['mask_iou_mean'] = float(np.mean(self.mask_ious))
+            results['iou_stats']['mask_iou_std'] = float(np.std(self.mask_ious))
+            results['iou_stats']['mask_iou_median'] = float(np.median(self.mask_ious))
+
         return results
 
 
@@ -500,10 +530,11 @@ def main():
         if not os.path.exists(img_path):
             continue
         
-        # Prédiction
+        # Prédiction — conf=0.001 pour inclure toutes les détections
+        # et construire la courbe PR sur toute la plage de confiance
         results = model.predict(
             img_path,
-            conf=CONFIG["score_threshold"],
+            conf=0.001,
             imgsz=CONFIG["image_size"],
             verbose=False
         )
