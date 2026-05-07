@@ -96,6 +96,7 @@ class ChannelAttention(nn.Module):
             nn.ReLU(),
             nn.Linear(mid, channels, bias=False),
         )
+        nn.init.zeros_(self.fc[-1].weight)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
@@ -109,6 +110,7 @@ class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super().__init__()
         self.conv    = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        nn.init.zeros_(self.conv.weight)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
