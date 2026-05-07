@@ -12,12 +12,14 @@ import os
 import json
 import yaml
 import shutil
+import random
 import numpy as np
 import torch
 import torch.nn as nn
 import argparse
 import gc
 from collections import OrderedDict
+from PIL import Image
 from ultralytics import YOLO
 from pycocotools.coco import COCO
 from pycocotools import mask as coco_mask_utils
@@ -375,10 +377,75 @@ def get_model_simple():
 
 
 def get_model_attention(cbam_reduction=16, cbam_kernel_size=7):
-    """YOLO26-seg avec CBAM injecté sur les sorties neck avant la tête Detect."""
-    model = get_model_simple()
-    _inject_cbam_yolo(model, cbam_reduction, cbam_kernel_size)
-    return model
+    """YOLO26-seg standard — CBAM sera injecté via le custom trainer."""
+    return get_model_simple()
+
+
+def _make_cbam_trainer(cbam_reduction=16, cbam_kernel_size=7):
+    """
+    Retourne une classe Trainer qui injecte CBAM dans get_model(), APRES que
+    Ultralytics recharge le modèle depuis le .pt. Cela garantit que les hooks
+    et les paramètres CBAM sont bien présents lors de la construction de l'optimiseur.
+    """
+    from ultralytics.models.yolo.segment import SegmentationTrainer as _Base
+
+    def _get_model(self, cfg=None, weights=None, verbose=True):
+        model = _Base.get_model(self, cfg=cfg, weights=weights, verbose=verbose)
+        _inject_cbam_nn(model, cbam_reduction, cbam_kernel_size)
+        return model
+
+    return type("CBAMSegTrainer", (_Base,), {"get_model": _get_model})
+
+
+def _inject_cbam_nn(nn_model, cbam_reduction=16, cbam_kernel_size=7):
+    """Injecte CBAM directement sur un nn.Module (DetectionModel/SegmentationModel)."""
+    detect_layer = nn_model.model[-1]
+    source_f     = detect_layer.f
+    n            = len(nn_model.model)
+    abs_indices  = [i if i >= 0 else n + i for i in source_f]
+
+    channels     = {}
+    temp_handles = []
+
+    def make_capture(idx):
+        def hook(m, inp, out):
+            if isinstance(out, torch.Tensor):
+                channels[idx] = out.shape[1]
+        return hook
+
+    for idx in abs_indices:
+        temp_handles.append(nn_model.model[idx].register_forward_hook(make_capture(idx)))
+
+    device = next(nn_model.parameters()).device
+    dummy  = torch.zeros(1, 3, 640, 640, device=device)
+    with torch.no_grad():
+        try:
+            nn_model(dummy)
+        except Exception:
+            pass
+    for h in temp_handles:
+        h.remove()
+
+    if not channels:
+        print("   [AVERTISSEMENT] Channels CBAM non detectes — mode simple utilise.")
+        return
+
+    cbam_dict = nn.ModuleDict({
+        str(idx): CBAM(c, cbam_reduction, cbam_kernel_size).to(device)
+        for idx, c in channels.items()
+    })
+    nn_model.cbam_attention = cbam_dict
+
+    def make_cbam_hook(cbam_mod):
+        def hook(m, inp, out):
+            if isinstance(out, torch.Tensor):
+                return cbam_mod(out)
+        return hook
+
+    for idx in channels:
+        nn_model.model[idx].register_forward_hook(make_cbam_hook(cbam_dict[str(idx)]))
+
+    print(f"   CBAM injecte sur {len(channels)} niveaux: {list(channels.values())} channels")
 
 
 def _inject_cbam_yolo(yolo_model, cbam_reduction=16, cbam_kernel_size=7):
@@ -450,12 +517,25 @@ def _run_optimization(yaml_path):
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def objective(trial):
+        import optuna
         lr0          = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
         weight_decay = trial.suggest_float("weight_decay",  1e-5, 1e-3, log=True)
         momentum     = trial.suggest_float("momentum",      0.80, 0.99)
 
         model = get_model_simple()
         gc.collect()
+
+        # Callback appelé à chaque fin d'epoch pour permettre au pruner d'agir
+        epoch_losses = []
+        def on_fit_epoch_end(trainer):
+            loss = trainer.metrics.get("val/seg_loss")
+            if loss is not None:
+                step = len(epoch_losses)
+                epoch_losses.append(float(loss))
+                trial.report(float(loss), step)
+                if trial.should_prune():
+                    raise optuna.exceptions.TrialPruned()
+        model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
 
         results = model.train(
             data=yaml_path,
@@ -538,7 +618,7 @@ def _run_optimization(yaml_path):
 # ENTRAÎNEMENT
 # =============================================================================
 
-def _run_training(model, yaml_path, model_config):
+def _run_training(model, yaml_path, model_config, trainer_cls=None):
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
     print("\n" + "=" * 70)
     print("   DEBUT DE L'ENTRAINEMENT")
@@ -549,7 +629,7 @@ def _run_training(model, yaml_path, model_config):
     start_time     = time.time()
     training_start = datetime.now()
 
-    results = model.train(
+    train_kwargs = dict(
         data=yaml_path,
         epochs=CONFIG["num_epochs"],
         batch=CONFIG["batch_size"],
@@ -569,6 +649,9 @@ def _run_training(model, yaml_path, model_config):
         workers=0,
         amp=False,
     )
+    if trainer_cls is not None:
+        train_kwargs["trainer"] = trainer_cls
+    results = model.train(**train_kwargs)
 
     gc.collect()
     if torch.cuda.is_available():
@@ -581,7 +664,8 @@ def _run_training(model, yaml_path, model_config):
     history = {'train_loss': [], 'val_loss': [], 'mAP50': [], 'mAP50_95': [],
                'epoch_times': [avg_epoch_t] * CONFIG["num_epochs"]}
 
-    train_dir   = os.path.join(CONFIG["output_dir"], "train")
+    # Ultralytics sauvegarde dans runs/segment/{project}/{name}/, pas dans {project}/{name}/
+    train_dir   = str(results.save_dir)
     results_csv = os.path.join(train_dir, "results.csv")
     if os.path.exists(results_csv):
         import csv
@@ -691,6 +775,8 @@ Modes disponibles:
 
     num_classes = len(CONFIG["classes"])
 
+    trainer_cls = None
+
     if args.mode == "simple":
         print(f"\nArchitecture: YOLO26{CONFIG['model_size']}-seg (standard)")
         model        = get_model_simple()
@@ -703,6 +789,7 @@ Modes disponibles:
         print(f"   cbam_reduction={cbam_r}, cbam_kernel_size={cbam_k}")
         model        = get_model_attention(cbam_r, cbam_k)
         model_config = {"mode": "attention", "cbam_reduction": cbam_r, "cbam_kernel_size": cbam_k}
+        trainer_cls  = _make_cbam_trainer(cbam_r, cbam_k)
 
     else:  # optimize
         print(f"\nArchitecture: YOLO26{CONFIG['model_size']}-seg (standard)")
@@ -718,7 +805,7 @@ Modes disponibles:
     print(f"   Classes: {CONFIG['classes']}")
     gc.collect()
 
-    _run_training(model, yaml_path, model_config)
+    _run_training(model, yaml_path, model_config, trainer_cls=trainer_cls)
 
 
 if __name__ == "__main__":

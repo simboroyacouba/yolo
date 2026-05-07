@@ -134,16 +134,29 @@ class MetricsCalculator:
 
             # Matrice IoU (n_pred x n_gt)
             iou_matrix = np.zeros((n_pred, n_gt))
+            box_iou_matrix = np.zeros((n_pred, n_gt))
+            mask_iou_matrix = np.zeros((n_pred, n_gt))
             for i in range(n_pred):
                 for j in range(n_gt):
                     box_iou_val = calculate_iou_boxes(pred_b[i], gt_b[j])
+                    box_iou_matrix[i, j] = box_iou_val
                     if pred_m and gt_m:
                         mask_iou_val = calculate_iou_masks(pred_m[i], gt_m[j])
+                        mask_iou_matrix[i, j] = mask_iou_val
                         iou_matrix[i, j] = (box_iou_val + mask_iou_val) / 2
-                        self.mask_ious.append(mask_iou_val)
                     else:
                         iou_matrix[i, j] = box_iou_val
-                    self.box_ious.append(box_iou_val)
+
+            # IoU stats: meilleure correspondance GT par prédiction (score >= seuil)
+            score_thresh = CONFIG.get('score_threshold', 0.5)
+            if n_gt > 0:
+                for i in range(n_pred):
+                    if pred_s[i] < score_thresh:
+                        continue
+                    best_j = int(np.argmax(iou_matrix[i]))
+                    self.box_ious.append(box_iou_matrix[i, best_j])
+                    if pred_m and gt_m:
+                        self.mask_ious.append(mask_iou_matrix[i, best_j])
 
             # Stocker chaque détection avec son score et ses IoU avec les GT
             for i in range(n_pred):
