@@ -129,6 +129,16 @@ class CBAM(nn.Module):
         return self.spatial_att(self.channel_att(x))
 
 
+class CBAMHook:
+    """Hook picklable pour CBAM — remplace les closures locales non-sérialisables."""
+    def __init__(self, cbam_mod):
+        self.cbam_mod = cbam_mod
+
+    def __call__(self, m, inp, out):
+        if isinstance(out, torch.Tensor):
+            return self.cbam_mod(out)
+
+
 # =============================================================================
 # AUGMENTATION PAR CLASSE
 # =============================================================================
@@ -449,14 +459,8 @@ def _inject_cbam_nn(nn_model, cbam_reduction=16, cbam_kernel_size=7):
     })
     nn_model.cbam_attention = cbam_dict
 
-    def make_cbam_hook(cbam_mod):
-        def hook(m, inp, out):
-            if isinstance(out, torch.Tensor):
-                return cbam_mod(out)
-        return hook
-
     for idx in channels:
-        nn_model.model[idx].register_forward_hook(make_cbam_hook(cbam_dict[str(idx)]))
+        nn_model.model[idx].register_forward_hook(CBAMHook(cbam_dict[str(idx)]))
 
     print(f"   CBAM injecte sur {len(channels)} niveaux: {list(channels.values())} channels")
 
@@ -507,15 +511,9 @@ def _inject_cbam_yolo(yolo_model, cbam_reduction=16, cbam_kernel_size=7):
     })
     nn_model.cbam_attention = cbam_dict  # registré → params inclus dans l'optimiseur
 
-    # --- hooks permanents ---
-    def make_cbam_hook(cbam_mod):
-        def hook(m, inp, out):
-            if isinstance(out, torch.Tensor):
-                return cbam_mod(out)
-        return hook
-
-    for idx, c in channels.items():
-        nn_model.model[idx].register_forward_hook(make_cbam_hook(cbam_dict[str(idx)]))
+    # --- hooks permanents (CBAMHook est picklable — pas de closure locale) ---
+    for idx in channels:
+        nn_model.model[idx].register_forward_hook(CBAMHook(cbam_dict[str(idx)]))
 
     print(f"   CBAM injecte sur {len(channels)} niveaux de features: {list(channels.values())} channels")
 
